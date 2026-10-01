@@ -1,0 +1,176 @@
+name: 构建 macOS 应用
+
+# =============================================================================
+#  用 GitHub 的免费 macOS 真机把本工程打包成自包含的 .app
+#
+#  这是绕过「PyInstaller 不支持交叉编译」的唯一可靠办法：
+#  你全程在 Windows 上操作，构建发生在 GitHub 托管的 macOS 机器上。
+#
+#  用法：
+#    1) 仓库根目录结构要求：
+#         你的仓库/
+#         ├── .github/workflows/build-macos.yml   ← 本文件
+#         └── novel_publisher_mac/                ← 整个源码文件夹
+#    2) 仓库 Actions 页 → 左侧「构建 macOS 应用」→ Run workflow → 选 arm64
+#    3) 等 5-10 分钟，在该次运行的 Artifacts 区下载 zip
+#
+#  注意：arch 一律通过 github.event.inputs.arch 读取。
+#  不能写成 inputs.arch —— 那个 context 只在 workflow_dispatch 下存在，
+#  push 触发时会直接报 Unrecognized named-value: 'inputs'。
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '目标架构（Apple Silicon 选 arm64，Intel 老机器选 x86_64）'
+        required: true
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - x86_64
+  push:
+    branches: [main, master]
+    paths:
+      - 'novel_publisher_mac/**'
+      - '.github/workflows/build-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 打包 ${{ github.event.inputs.arch || 'arm64' }}
+    # macos-14 = Apple Silicon(M1)；macos-13 = Intel
+    runs-on: ${{ github.event.inputs.arch == 'x86_64' && 'macos-13' || 'macos-14' }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: novel_publisher_mac
+
+    steps:
+      - name: 取出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 准备解释器（确保带 tkinter，并建独立 venv）
+        run: |
+          set -eux
+          BASE="$(command -v python3.10)"
+          if python3.10 -c 'import tkinter, tkinter.TkVersion' 2>/dev/null; then
+            echo "setup-python 的构建自带 tkinter"
+          else
+            echo "setup-python 的构建不含 tkinter，改装 Homebrew 版"
+            brew install python@3.10 python-tk@3.10
+            BASE="$(brew --prefix)/opt/python@3.10/bin/python3.10"
+          fi
+          test -x "$BASE"
+          "$BASE" -V
+          "$BASE" -c 'import tkinter; print("tk", tkinter.TkVersion)'
+
+          # 关键：Homebrew 的 python 被标为 externally-managed，直接 pip install
+          # 会被 PEP 668 拒绝（error: externally-managed-environment）。
+          # 用 venv 绕过 —— venv 不受该策略管辖。
+          VENV="$RUNNER_TEMP/build-venv"
+          "$BASE" -m venv "$VENV"
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          echo "PYTHON=$VENV/bin/python" >> "$GITHUB_ENV"
+          "$VENV/bin/python" -V
+          "$VENV/bin/python" -c 'import tkinter; print("venv 内 tkinter OK")'
+
+      - name: 环境自检
+        run: |
+          set -eux
+          PY="${PYTHON:-python3.10}"
+          uname -m
+          sw_vers
+          $PY -V
+          $PY -c 'import sys, tkinter; print("解释器:", sys.executable); print("tkinter OK")'
+
+      - name: 生成应用图标
+        run: |
+          set -eux
+          PY="${PYTHON:-python3.10}"
+          $PY -m pip install --quiet pillow
+          # 先用 Python 手工构造一份 icns —— 保证无论如何都有图标
+          $PY gen_icns.py assets/app_icon.png assets/app.icns
+          # 再用 macOS 原生工具重做一份，Retina 下效果更好
+          ( cd assets && bash make_icns.sh ) || echo "sips/iconutil 未生效，沿用 Python 生成的版本"
+          ls -l assets/app.icns
+
+      - name: 安装依赖
+        run: |
+          set -eux
+          PY="${PYTHON:-python3.10}"
+          $PY -m pip install --upgrade pip
+          $PY -m pip install -r requirements-mac.txt
+
+      - name: 业务自检（不过就不打包）
+        run: |
+          set -eux
+          PY="${PYTHON:-python3.10}"
+          $PY selftest_business.py
+
+      - name: PyInstaller 打包
+        env:
+          TARGET_ARCH: ${{ github.event.inputs.arch || 'arm64' }}
+        run: |
+          set -eux
+          PY="${PYTHON:-python3.10}"
+          rm -rf build dist
+          $PY -m PyInstaller --noconfirm --clean --log-level=INFO novel_publisher_mac.spec
+          ls -la dist/
+
+      - name: 修权限 + ad-hoc 签名
+        run: |
+          set -eux
+          APP="dist/寒山小说发布工具.app"
+          test -d "$APP"
+
+          # 1) 先修 node 可执行位。注意必须在签名之前做 ——
+          #    改动包内任何文件都会让已有签名失效。
+          NODE="$(find "$APP" -type f -name node -path '*playwright/driver*' | head -1 || true)"
+          if [ -n "$NODE" ]; then
+            chmod +x "$NODE"
+            echo "已恢复 node 可执行位: $NODE"
+          else
+            echo "::warning::包内未找到 playwright/driver/node，首次运行可能需要联网"
+          fi
+
+          # 2) 再签名
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | head -5 || true
+          du -sh "$APP"
+
+      - name: 打包成可下载的 zip
+        run: |
+          set -eux
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          # 必须用 ditto：普通 zip 会破坏 .app 内的符号链接与权限位
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/寒山小说发布工具.app" \
+            "dist/寒山小说发布工具-macOS-${ARCH}.zip"
+          ls -lh dist/*.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 寒山小说发布工具-macOS-${{ github.event.inputs.arch || 'arm64' }}
+          path: novel_publisher_mac/dist/*.zip
+          retention-days: 30
+
+      - name: 失败时打印诊断
+        if: failure()
+        run: |
+          echo "::group::spec 输出"
+          find . -name 'warn-*.txt' -maxdepth 2 -exec cat {} \; || true
+          echo "::endgroup::"
+          echo "::group::dist 目录"
+          ls -laR dist 2>/dev/null | head -80 || echo "dist 不存在"
+          echo "::endgroup::"
